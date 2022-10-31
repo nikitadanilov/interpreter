@@ -100,30 +100,35 @@ enum {
 	AM_IDX  = 0b00001111,
 	AM_IMM  = 0b00000000,
 	AM_SLOT = 0b00010000,
-	AM_REG  = 0b00100000
+	AM_REG  = 0b00100000,
+	AM_SLOR = 0b00110000
 };
 
-#define ADDR ({						\
-	uint8_t  next = N8;					\
-	uint64_t addr;						\
-	switch (next & AM_MASK) {				\
-	case AM_IMM:						\
-		addr = U64(pc); 				\
-		pc += 8;					\
-		break;						\
-	case AM_SLOT:						\
-		addr = U64(P64(sf) + (next & AM_IDX));		\
-		break;						\
-	case AM_REG:						\
-		addr = U64(&regs.r[next & AM_IDX]);		\
-		break;						\
-	default:						\
-		printf("Wrong addressing mode: %02x\n", next);	\
-		assert(0);					\
-	}							\
-	if (next & AM_REF)					\
-		addr = DEREF(addr);     			\
-	U64(addr);						\
+#define ADDR ({					\
+	uint8_t  next = N8;				\
+	uint64_t addr;					\
+	uint8_t  idx  = next & AM_IDX;			\
+	switch (next & AM_MASK) {			\
+	case AM_IMM:					\
+		addr = U64(pc); 			\
+		pc += 8;				\
+		break;					\
+	case AM_SLOT:					\
+		addr = U64(P64(sf) + idx);		\
+		break;					\
+	case AM_SLOR:					\
+		addr = U64(P64(regs.r[3]) + idx);       \
+		break;					\
+	case AM_REG:					\
+		addr = U64(&regs.r[idx]);		\
+		break;					\
+	default:					\
+		printf("Wrong mode: %02x\n", next);	\
+		assert(0);				\
+	}						\
+	if (next & AM_REF)				\
+		addr = DEREF(addr);			\
+	U64(addr);					\
 })
 
 /* Little-endian. */
@@ -319,6 +324,8 @@ static void arg(const char *s, int *idx, struct prog *prog) {
 		outimm(prog, val, ref);
 	} else if (in(s, idx, ":")) { /* Slot. */
 		out8(prog, AM_SLOT | ref | getnum(s, idx));
+	} else if (in(s, idx, "/")) { /* Slor. */
+		out8(prog, AM_SLOR | ref | getnum(s, idx));
 	} else if (in(s, idx, "r")) { /* Register */
 		out8(prog, AM_REG | ref | getnum(s, idx));
 	} else if (in(s, idx, "pc")) {
@@ -341,21 +348,22 @@ static void arg(const char *s, int *idx, struct prog *prog) {
 	}
 }
 
+static struct cmd {
+	const char *name;
+	uint8_t     opc;
+	int         arity;
+} cmd[] = {
+	{ "trap",   O_TRAP,   0 },
+	{ "nop",    O_NOP,    0 },
+	{ "halt",   O_HALT,   0 },
+	{ "alloc",  O_ALLOC,  2 },
+	{ "resume", O_RESUME, 2 },
+	{ "set",    O_SET,    2 },
+	{ "add",    O_ADD,    3 }
+};
+
 static void parse1(const char *inst, struct prog *prog) {
 	int idx = 0;
-	static struct cmd {
-		const char *name;
-		uint8_t     opc;
-		int         arity;
-	} cmd[] = {
-		{ "trap",   O_TRAP,   0 },
-		{ "nop",    O_NOP,    0 },
-		{ "halt",   O_HALT,   0 },
-		{ "alloc",  O_ALLOC,  2 },
-		{ "resume", O_RESUME, 2 },
-		{ "set",    O_SET,    2 },
-		{ "add",    O_ADD,    3 }
-	};
 	skip(inst, &idx);
 	if (in(inst, &idx, ".")) { /* A label. */
 		add(prog, inst, &idx, prog->off);
@@ -406,7 +414,68 @@ static void dump(const struct prog *prog) {
 		}
 	}
 	puts("");
-};
+}
+
+static int disarg(const struct prog *prog, int off) {
+	uint8_t *start = prog->start;
+	uint8_t  arg   = start[off];
+	uint8_t  idx   = arg & AM_IDX;
+	uint8_t  mod   = arg & AM_MASK;
+	++off;
+	if (arg & AM_REF) {
+		printf("*");
+	}
+	if (mod == AM_IMM) {
+		uint64_t val = DEREF(&start[off]);
+		if (U64(start) <= val && val < U64(start) + prog->off) {
+			printf("<+%"PRIx64">", val - U64(start));
+		} else {
+			printf("#%"PRIx64, val);
+		}
+		off += 8;
+	} else if (mod == AM_SLOT) {
+		printf(":%1x", idx);
+	} else if (mod == AM_SLOR) {
+		printf("/%1x", idx);
+	} else if (mod == AM_REG) {
+		if (idx < R_REST) {
+			printf("%s", (char *[]){ [R_PC] = "pc", [R_SF] = "sf",
+						 [R_SP] = "sp" }[idx]);
+		} else {
+			printf("r%1x", idx);
+		}
+	} else {
+		assert(0);
+	}
+	return off;
+}
+
+static int dis1(const struct prog *prog, int off) {
+	int i;
+	for (i = 0; i < ARRAY_SIZE(cmd); ++i) {
+		if (prog->start[off] == cmd[i].opc) {
+			printf(RF"+%4x        %-6s ", U64(prog->start), off,
+			       cmd[i].name);
+			++off;
+			for (int j = 0; j < cmd[i].arity; ++j) {
+				off = disarg(prog, off);
+				printf(" ");
+			}
+			puts("");
+			break;
+		}
+	}
+	assert(i < ARRAY_SIZE(cmd));
+	return off;
+}
+
+static void dis(const struct prog *prog)
+{
+	int off = 0;
+	while (off < prog->off) {
+		off = dis1(prog, off);
+	}
+}
 
 int main(int argc, char **argv)
 {
@@ -419,19 +488,20 @@ int main(int argc, char **argv)
 	compile(&prog, (const char *[]){
 			"; main",
 			".entry nop",
-			"       alloc #8 r4",
-			"       add r4 #8 r5",
-			"       set .ret *r5",
-			"       resume r4 .sub",
+			"       alloc #8 r3",
+			"       set .ret :0",
+			"       set sf /1",
+			"       resume r3 .sub",
 			".ret   trap",
 			"       halt",
 			"; sub",
 			".sub   ",
 			"       set #7 r3",
 			"       add r3 #8 r5",
-			"       resume sf :1",
+			"       resume :1 *:1",
 			NULL });
 	dump(&prog);
+	dis(&prog);
 	struct proc p = {
 		.regs = {
 			.r[R_PC] = (uint64_t)prog.start,
