@@ -95,13 +95,13 @@ static uint64_t alloc(uint64_t slots) {
 }
 
 enum {
-	AM_MASK = 0b01110000,
+	AM_MASK = 0b00110000,
 	AM_REF  = 0b10000000,
 	AM_IDX  = 0b00001111,
 	AM_IMM  = 0b00000000,
 	AM_SLOT = 0b00010000,
 	AM_REG  = 0b00100000,
-	AM_SLOR = 0b00110000
+	AM_SLOR = 0b01000000
 };
 
 #define ADDR ({					\
@@ -116,9 +116,6 @@ enum {
 	case AM_SLOT:					\
 		addr = U64(P64(sf) + idx);		\
 		break;					\
-	case AM_SLOR:					\
-		addr = U64(P64(regs.r[3]) + idx);       \
-		break;					\
 	case AM_REG:					\
 		addr = U64(&regs.r[idx]);		\
 		break;					\
@@ -126,6 +123,8 @@ enum {
 		printf("Wrong mode: %02x\n", next);	\
 		assert(0);				\
 	}						\
+	if (next & AM_SLOR)				\
+		addr = U64(P64(DEREF(addr)) + N8);	\
 	if (next & AM_REF)				\
 		addr = DEREF(addr);			\
 	U64(addr);					\
@@ -259,13 +258,13 @@ static void skip(const char *s, int *idx) {
 		*idx += strlen(s + *idx);
 }
 
-static int getnum(const char *s, int *idx) {
+static int getnum(const char *s, int *idx, int limit) {
 	int n;
 	int val;
 	int nob;
 	n = sscanf(s + *idx, "%i%n", &val, &nob);
 	assert(n == 1);
-	assert(0 <= val && val < 16);
+	assert(0 <= val && val < limit);
 	*idx += nob;
 	return val;
 }
@@ -313,6 +312,7 @@ static void out8(struct prog *prog, uint8_t val) {
 
 static void arg(const char *s, int *idx, struct prog *prog) {
 	uint8_t ref;
+	uint8_t *cur = at(prog);
 	skip(s, idx);
 	ref = in(s, idx, "*") ? AM_REF : 0;
 	if (in(s, idx, "#")) { /* Immediate argument. */
@@ -323,11 +323,9 @@ static void arg(const char *s, int *idx, struct prog *prog) {
 		*idx += nob;
 		outimm(prog, val, ref);
 	} else if (in(s, idx, ":")) { /* Slot. */
-		out8(prog, AM_SLOT | ref | getnum(s, idx));
-	} else if (in(s, idx, "/")) { /* Slor. */
-		out8(prog, AM_SLOR | ref | getnum(s, idx));
+		out8(prog, AM_SLOT | ref | getnum(s, idx, 16));
 	} else if (in(s, idx, "r")) { /* Register */
-		out8(prog, AM_REG | ref | getnum(s, idx));
+		out8(prog, AM_REG | ref | getnum(s, idx, 16));
 	} else if (in(s, idx, "pc")) {
 		out8(prog, AM_REG | ref | R_PC);
 	} else if (in(s, idx, "sp")) {
@@ -346,6 +344,11 @@ static void arg(const char *s, int *idx, struct prog *prog) {
 	} else {
 		assert(0);
 	}
+	if (in(s, idx, "/")) { /* Slor. */
+		out8(prog, getnum(s, idx, 256));
+		*cur |= AM_SLOR;
+	}
+
 }
 
 static struct cmd {
@@ -435,8 +438,6 @@ static int disarg(const struct prog *prog, int off) {
 		off += 8;
 	} else if (mod == AM_SLOT) {
 		printf(":%1x", idx);
-	} else if (mod == AM_SLOR) {
-		printf("/%1x", idx);
 	} else if (mod == AM_REG) {
 		if (idx < R_REST) {
 			printf("%s", (char *[]){ [R_PC] = "pc", [R_SF] = "sf",
@@ -446,6 +447,10 @@ static int disarg(const struct prog *prog, int off) {
 		}
 	} else {
 		assert(0);
+	}
+	if (arg & AM_SLOR) {
+		printf("/%02x", *(uint8_t *)&start[off]);
+		++off;
 	}
 	return off;
 }
@@ -490,7 +495,7 @@ int main(int argc, char **argv)
 			".entry nop",
 			"       alloc #8 r3",
 			"       set .ret :0",
-			"       set sf /1",
+			"       set sf r3/1",
 			"       resume r3 .sub",
 			".ret   trap",
 			"       halt",
