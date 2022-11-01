@@ -16,6 +16,8 @@ enum opc {
 	O_RESUME        = 0x04,
 	O_SET           = 0x05,
 	O_ADD           = 0x06,
+	O_MUL           = 0x07,
+	O_IF0           = 0x08,
 	O_NR            = 0xff + 1
 };
 
@@ -23,6 +25,14 @@ struct opcode {
 	const char *o_name;
 	void       *o_branch;
 };
+
+#define DEBUG (1)
+
+#if DEBUG
+#define ON_DEBUG(...) __VA_ARGS__
+#else
+#define ON_DEBUG(...)
+#endif
 
 static struct opcode opcode[O_NR] = {};
 
@@ -39,8 +49,10 @@ static struct opcode opcode[O_NR] = {};
 	opcode[opc].o_branch = label;			\
 })
 
+static void trace(uint64_t p);
+
 #define OI(x) OINIT(O_ ## x, L_ ## x, #x)
-#define CONT ({ goto *branches[*(uint8_t *)pc++]; })
+#define CONT ({ ON_DEBUG(trace(pc)); goto *branches[*(uint8_t *)pc++]; })
 
 enum { REGS = 16 };
 
@@ -69,8 +81,7 @@ struct proc {
 #define U64(x) ((uint64_t)(x))
 #define P64(x) ((uint64_t *)(x))
 #define DEREF(x) (*P64(x))
-#define N8 (*(uint8_t *)pc++)
-#define N64 (*(uint64_t *)pc++)
+#define N8  (*(uint8_t *)pc++)
 
 enum trapcode {
 	T_TRAP = 0x00, /* Trap instruction. */
@@ -191,13 +202,31 @@ static void interpret(struct proc *p) {
 	L_SET:
 		s0 = ADDR;
 		s1 = ADDR;
+		ON_DEBUG(printf("    *"RF" := "RF"\n", s1, DEREF(s0)));
 		DEREF(s1) = DEREF(s0);
 		CONT;
 	L_ADD:
 		s0 = ADDR;
 		s1 = ADDR;
 		s2 = ADDR;
+		ON_DEBUG(printf("    *"RF" := "RF" + "RF"\n",
+				s2, DEREF(s0), DEREF(s1)));
 		DEREF(s2) = DEREF(s0) + DEREF(s1);
+		CONT;
+	L_MUL:
+		s0 = ADDR;
+		s1 = ADDR;
+		s2 = ADDR;
+		ON_DEBUG(printf("    *"RF" := "RF" * "RF"\n",
+				s2, DEREF(s0), DEREF(s1)));
+		DEREF(s2) = DEREF(s0) * DEREF(s1);
+		CONT;
+	L_IF0:
+		s0 = ADDR;
+		s1 = ADDR;
+		ON_DEBUG(printf("    "RF" == 0?\n", DEREF(s0)));
+		if (DEREF(s0) == 0)
+			pc = DEREF(s1);
 		CONT;
 	} else if (p != NULL) {
 		DEIFY(p);
@@ -210,6 +239,8 @@ static void interpret(struct proc *p) {
 		OI(RESUME);
 		OI(SET);
 		OI(ADD);
+		OI(MUL);
+		OI(IF0);
 	}
 }
 
@@ -318,7 +349,7 @@ static void arg(const char *s, int *idx, struct prog *prog) {
 	if (in(s, idx, "#")) { /* Immediate argument. */
 		uint64_t val;
 		int nob;
-		int n = sscanf(s + *idx, "%"SCNi64"%n", &val, &nob);
+		int n = sscanf(s + *idx, "%"SCNx64"%n", &val, &nob);
 		assert(n == 1);
 		*idx += nob;
 		outimm(prog, val, ref);
@@ -362,7 +393,9 @@ static struct cmd {
 	{ "alloc",  O_ALLOC,  2 },
 	{ "resume", O_RESUME, 2 },
 	{ "set",    O_SET,    2 },
-	{ "add",    O_ADD,    3 }
+	{ "add",    O_ADD,    3 },
+	{ "mul",    O_MUL,    3 },
+	{ "if0",    O_IF0,    2 }
 };
 
 static void parse1(const char *inst, struct prog *prog) {
@@ -482,6 +515,14 @@ static void dis(const struct prog *prog)
 	}
 }
 
+static void trace(uint64_t p)
+{
+	const struct prog prog = {
+		.start = (uint8_t *)(p),
+	};
+	dis1(&prog, 0);
+}
+
 int main(int argc, char **argv)
 {
 	uint64_t frame[8] = {};
@@ -493,10 +534,10 @@ int main(int argc, char **argv)
 	compile(&prog, (const char *[]){
 			"; main",
 			".entry nop",
-			"       alloc #8 r3",
+			"       alloc #8 :1",
 			"       set .ret :0",
-			"       set sf r3/1",
-			"       resume r3 .sub",
+			"       set sf :1/1",
+			"       resume :1 .sub",
 			".ret   trap",
 			"       halt",
 			"; sub",
@@ -508,6 +549,34 @@ int main(int argc, char **argv)
 	dump(&prog);
 	dis(&prog);
 	struct proc p = {
+		.regs = {
+			.r[R_PC] = (uint64_t)prog.start,
+			.r[R_SF] = (uint64_t)frame
+		}
+	};
+	interpret(&p);
+	prog = (struct prog){ .start = image };
+	compile(&prog, (const char *[]){
+			"       set #a :2",
+			".fact",
+			"       if0 :2 .end",
+			"       alloc #8 :1",
+			"       set .ret :0",
+			"       set sf :1/4",
+			"       add :2 #ffffffffffffffff :1/2",
+			"       resume :1 .fact",
+			".ret   mul :2 :3 r4",
+			"       if0 :4 .done",
+			"       set r4 :4/3",
+			"       resume :4 :4/0",
+			".end   set #1 :4/3",
+			"       resume :4 :4/0",
+			".done  trap",
+			"       halt",
+			NULL });
+	dump(&prog);
+	dis(&prog);
+	p = (struct proc ){
 		.regs = {
 			.r[R_PC] = (uint64_t)prog.start,
 			.r[R_SF] = (uint64_t)frame
