@@ -169,8 +169,6 @@ enum {
 	((x) & 0x00ff000000000000) >> 48,	\
 	((x) & 0xff00000000000000) >> 56
 
-#define SLOT(x) ((uint8_t)(AM_SLOT | (x)))
-#define REG(x)  ((uint8_t)(AM_REG  | (x)))
 #define TRAP(code) ({ *p = REIFY; trap(p, (code)); DEIFY(p); })
 
 static void interpret(struct proc *p) {
