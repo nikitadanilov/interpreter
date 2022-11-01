@@ -91,11 +91,16 @@ enum trapcode {
 
 static void trap(struct proc *p, uint8_t code) {
 	printf("trap: %02x\n", code);
-	printf("pc: "RF" ", U64(p->regs.r[R_PC]));
-	printf("sf: "RF" ", U64(p->regs.r[R_SF]));
-	printf("sp: "RF" ", U64(p->regs.r[R_SP]));
+	printf("pc "RF" ", U64(p->regs.r[R_PC]));
+	printf("sf "RF" ", U64(p->regs.r[R_SF]));
+	printf("sp "RF" ", U64(p->regs.r[R_SP]));
 	for (int i = R_REST; i < ARRAY_SIZE(p->regs.r); ++i) {
-		printf("r%01x: "RF"%s", i, p->regs.r[i], i%4 == 3 ? "\n" : " ");
+		printf("r%01x "RF"%s", i, p->regs.r[i], i%4 == 3 ? "\n" : " ");
+	}
+	puts("");
+	for (int i = 0; i < 8; ++i) {
+		printf(":%01x "RF"%s", i, DEREF(p->regs.r[R_SF] + i),
+		       i%4 == 3 ? "\n" : " ");
 	}
 	puts("");
 }
@@ -188,6 +193,7 @@ static void interpret(struct proc *p) {
 		s1 = ADDR;
 		s2 = alloc(DEREF(s0));
 		DEREF(s1) = s2;
+		ON_DEBUG(printf("    new("RF") == "RF"\n", DEREF(s0), s2));
 		if (unlikely(s2 == 0)) {
 			TRAP(T_OOM);
 		}
@@ -209,16 +215,16 @@ static void interpret(struct proc *p) {
 		s0 = ADDR;
 		s1 = ADDR;
 		s2 = ADDR;
-		ON_DEBUG(printf("    *"RF" := "RF" + "RF"\n",
-				s2, DEREF(s0), DEREF(s1)));
+		ON_DEBUG(printf("    *"RF" := "RF" + "RF" == "RF"\n", s2,
+				DEREF(s0), DEREF(s1), DEREF(s0) + DEREF(s1)));
 		DEREF(s2) = DEREF(s0) + DEREF(s1);
 		CONT;
 	L_MUL:
 		s0 = ADDR;
 		s1 = ADDR;
 		s2 = ADDR;
-		ON_DEBUG(printf("    *"RF" := "RF" * "RF"\n",
-				s2, DEREF(s0), DEREF(s1)));
+		ON_DEBUG(printf("    *"RF" := "RF" * "RF" == "RF"\n", s2,
+				DEREF(s0), DEREF(s1), DEREF(s0) * DEREF(s1)));
 		DEREF(s2) = DEREF(s0) * DEREF(s1);
 		CONT;
 	L_IF0:
