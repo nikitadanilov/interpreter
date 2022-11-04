@@ -318,17 +318,22 @@ static int find(struct prog *prog, const char *name) {
 	assert(0); /* Too many labels. */
 }
 
-static struct label *add(struct prog *prog, const char *inst, int *idx, int loc) {
-	int end = *idx;
-	int lidx;
-	char name[MAX_LABEL_NAME + 1] = {};
-	while (isalnum(inst[end])) {
+static int labellen(const char *s, int idx) {
+	int end = idx;
+	while (isalnum(s[end])) {
 		++end;
 	}
-	assert(end > *idx);
-	assert(end - *idx <= MAX_LABEL_NAME);
-	memcpy(name, inst + *idx, end - *idx);
-	*idx = end;
+	assert(end > idx);
+	assert(end - idx <= MAX_LABEL_NAME);
+	return end - idx;
+}
+
+static struct label *add(struct prog *prog, const char *inst, int *idx, int loc) {
+	int lidx;
+	char name[MAX_LABEL_NAME + 1] = {};
+	int len = labellen(inst, *idx);
+	memcpy(name, inst + *idx, len);
+	*idx += len;
 	lidx = find(prog, name);
 	if (prog->label[lidx].off == 0)
 		prog->label[lidx].off = loc;
@@ -402,11 +407,33 @@ static struct cmd {
 	{ "if0",    O_IF0,    2 }
 };
 
+static void data(struct prog *prog, const char *s, int idx) {
+	skip(s, &idx);
+	if (in(s, &idx, "\"")) {
+		while (s[idx] != '"') {
+			out8(prog, s[idx++]);
+		}
+	} else {
+		while (1) {
+			int nob;
+			uint8_t val;
+			int n = sscanf(s + idx, " %"SCNx8"%n ", &val, &nob);
+			if (n <= 0) /* NO_BUG_IN_ISO_C_CORRIGENDUM_1 */
+				break;
+			idx += nob;
+			out8(prog, val);
+		}
+	}
+}
+
 static void parse1(const char *inst, struct prog *prog) {
 	int idx = 0;
 	skip(inst, &idx);
 	if (in(inst, &idx, ".")) { /* A label. */
 		add(prog, inst, &idx, prog->off);
+	}
+	if (in(inst, &idx, "=")) { /* Data. */
+		return data(prog, inst, idx);
 	}
 	for (int i = 0; i < ARRAY_SIZE(cmd); ++i) {
 		if (in(inst, &idx, cmd[i].name)) {
@@ -494,10 +521,11 @@ static int disarg(const struct prog *prog, int off) {
 
 static int dis1(const struct prog *prog, int off) {
 	int i;
+	char ch = prog->start[off];
 	for (i = 0; i < ARRAY_SIZE(cmd); ++i) {
-		if (prog->start[off] == cmd[i].opc) {
-			printf(RF"+%4x        %-6s ", U64(prog->start), off,
-			       cmd[i].name);
+		if (ch == cmd[i].opc) {
+			printf(RF"+%4x        %-6s ",
+			       U64(prog->start + off), off, cmd[i].name);
 			++off;
 			for (int j = 0; j < cmd[i].arity; ++j) {
 				off = disarg(prog, off);
@@ -507,7 +535,12 @@ static int dis1(const struct prog *prog, int off) {
 			break;
 		}
 	}
-	assert(i < ARRAY_SIZE(cmd));
+	if (i == ARRAY_SIZE(cmd)) {
+		printf(RF"+%4x        data: %02x '%c'\n",
+		       U64(prog->start + off), off, ch & 0xff,
+		       isprint(ch) ? ch : '.');
+		++off;
+	}
 	return off;
 }
 
@@ -525,6 +558,178 @@ static void trace(uint64_t p)
 		.start = (uint8_t *)(p),
 	};
 	dis1(&prog, 0);
+}
+
+enum { MAX_CLINE = 1024 };
+
+#define OUT(s, pos, ...) ({						\
+	char _scratch[MAX_CLINE] = {};					\
+	strcpy(_scratch, s);						\
+	pos += snprintf(_scratch + pos, MAX_CLINE - pos, __VA_ARGS__);	\
+	assert(pos < MAX_CLINE);					\
+	strcpy(s, _scratch);						\
+})
+
+#define OUT0(s, pos, ...) ({			\
+	pos = 0;				\
+	OUT(s, pos, __VA_ARGS__);		\
+})
+
+static const char *atoc(const char *s, int *idx, char *out, int pos, int lval) {
+	int odx = 0;
+	skip(s, idx);
+	int ref = in(s, idx, "*");
+	if (ref && lval) {
+		lval = 0;
+		ref = 0;
+	}
+	if (in(s, idx, "#")) { /* Immediate argument. */
+		uint64_t val;
+		int nob;
+		int n = sscanf(s + *idx, "%"SCNx64"%n", &val, &nob);
+		assert(n == 1);
+		*idx += nob;
+		if (lval) {
+			OUT(out, odx,
+			    "({ param%i = U64(0x%"PRIx64"ULL); &param%i; })",
+			    pos, val, pos);
+		} else {
+			OUT(out, odx, "0x%"PRIx64"ULL", val);
+		}
+	} else if (in(s, idx, ":")) { /* Slot. */
+		OUT(out, odx, "%s(P64(regs.r[R_SF]) + 0x%1x)",
+		    lval ? "" : "DEREF", getnum(s, idx, 16));
+	} else if (in(s, idx, "r")) { /* Register */
+		OUT(out, odx, "%sregs.r[0x%1x]",
+		    lval ? "&" : "", getnum(s, idx, 16));
+	} else if (in(s, idx, "pc")) {
+		OUT(out, odx, "%sregs.r[R_PC]", lval ? "&" : "");
+	} else if (in(s, idx, "sp")) {
+		OUT(out, odx, "%sregs.r[R_SP]", lval ? "&" : "");
+	} else if (in(s, idx, "sf")) {
+		OUT(out, odx, "%sregs.r[R_SF]", lval ? "&" : "");
+	} else if (in(s, idx, ".")) { /* Label */
+		int len = labellen(s, *idx);
+		if (lval) {
+			OUT(out, odx, "({ param%i = U64(&&%*.*s); &param%i; })",
+			    pos, len, len, s + *idx, pos);
+		} else {
+			OUT(out, odx, "&&%*.*s", len, len, s + *idx);
+		}
+		*idx += len;
+	} else {
+		assert(0);
+	}
+	if (in(s, idx, "/")) { /* Slor. */
+		OUT0(out, odx, "%s(P64(DEREF(%s)) + 0x%02x)",
+		     lval ? "" : "DEREF", out, getnum(s, idx, 256));
+	}
+	if (ref) {
+		OUT0(out, odx, "DEREF(%s)", out);
+	}
+	OUT0(out, odx, "U64(%s)", out);
+	skip(s, idx);
+	return out;
+}
+
+static const char *dtoc(const char *code, int *idx, char *out) {
+	*idx = strlen(code);
+	return out;
+}
+
+static char *ctoc1(const char *code, int lineno, char *out) {
+	int idx = 0;
+	int odx = 0;
+	int post = 0;
+	char scratch[3][MAX_CLINE] = {};
+
+	skip(code, &idx);
+	if (in(code, &idx, ".")) { /* A label. */
+		int len = labellen(code, idx);
+		OUT(out, odx, "%*.*s:\n", len, len, code + idx);
+		idx += len;
+	}
+	skip(code, &idx);
+	OUT(out, odx, "        { // %s\n", code);
+	if (in(code, &idx, "=")) {
+		OUT(out, odx, "%s", dtoc(code, &idx, scratch[0]));
+	} else if (in(code, &idx, "trap")) {
+		OUT(out, odx, "                TRAP(T_TRAP);");
+	} else if (in(code, &idx, "nop")) {
+		OUT(out, odx, "                ;");
+	} else if (in(code, &idx, "halt")) {
+		OUT(out, odx, "                return;");
+	} else if (in(code, &idx, "alloc")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 1);
+		OUT(out, odx,
+    "                uint64_t size = %s;\n"
+    "                if (unlikely((DEREF(%s) = alloc(size)) == 0)) {\n"
+    "                        TRAP(T_OOM);\n"
+    "                }",
+		    scratch[0], scratch[1]);
+	} else if (in(code, &idx, "resume")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 0);
+		OUT(out, odx,
+    "                uint64_t frame  = %s;\n"
+    "                uint64_t target = %s;\n"
+    "                DEREF(regs.r[R_SF]) = U64(&&_L_%04i);\n"
+    "                regs.r[R_SF] = frame;\n"
+    "                goto *(void *)target;",
+		    scratch[0], scratch[1], lineno + 1);
+		post = 1;
+	} else if (in(code, &idx, "set")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 1);
+		OUT(out, odx,
+    "                uint64_t src = %s;\n"
+    "                uint64_t dst = %s;\n"
+    "                DEREF(dst) = src;",
+		    scratch[0], scratch[1]);
+	} else if (in(code, &idx, "add")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 0);
+		atoc(code, &idx, scratch[2], 2, 1);
+		OUT(out, odx,
+    "                uint64_t a = %s;\n"
+    "                uint64_t b = %s;\n"
+    "                uint64_t c = %s;\n"
+    "                DEREF(c) = a + b;",
+		    scratch[0], scratch[1], scratch[2]);
+	} else if (in(code, &idx, "mul")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 0);
+		atoc(code, &idx, scratch[2], 2, 1);
+		OUT(out, odx,
+    "                uint64_t a = %s;\n"
+    "                uint64_t b = %s;\n"
+    "                uint64_t c = %s;\n"
+    "                DEREF(c) = a * b;",
+		    scratch[0], scratch[1], scratch[2]);
+	} else if (in(code, &idx, "if0")) {
+		atoc(code, &idx, scratch[0], 0, 0);
+		atoc(code, &idx, scratch[1], 1, 0);
+		OUT(out, odx,
+    "                if (%s == 0) {\n"
+    "                        goto *(void *)%s;\n"
+    "                }",
+		    scratch[0], scratch[1]);
+	}
+	skip(code, &idx);
+	assert(code[idx] == 0);
+	OUT(out, odx, "\n        }\n");
+	if (post)
+		OUT(out, odx, "_L_%04i:\n", lineno + 1);
+	return out;
+}
+
+static void ctoc(const char **code) {
+	for (int i = 0; code[i] != NULL; ++i) {
+		char out[MAX_CLINE] = {};
+		ctoc1(code[i], i, out);
+		printf("%s", out);
+	}
 }
 
 int main(int argc, char **argv)
@@ -560,24 +765,26 @@ int main(int argc, char **argv)
 	};
 	interpret(&p);
 	prog = (struct prog){ .start = image };
-	compile(&prog, (const char *[]){
+	const char *as[] = {
 			"       set #a :2",
 			".fact",
 			"       if0 :2 .end",
 			"       alloc #8 :1",
-			"       set .ret :0",
 			"       set sf :1/4",
 			"       add :2 #ffffffffffffffff :1/2",
 			"       resume :1 .fact",
 			".ret   mul :2 :3 r4",
 			"       if0 :4 .done",
 			"       set r4 :4/3",
-			"       resume :4 :4/0",
+			"       resume :4 *:4",
 			".end   set #1 :4/3",
-			"       resume :4 :4/0",
+			"       resume :4 *:4",
 			".done  trap",
 			"       halt",
-			NULL });
+			".data  = ac c0 1a de",
+			".hello = \"Hello, world!\"",
+			NULL };
+	compile(&prog, as);
 	dump(&prog);
 	dis(&prog);
 	p = (struct proc ){
@@ -587,5 +794,6 @@ int main(int argc, char **argv)
 		}
 	};
 	interpret(&p);
+	ctoc(as);
 	return 0;
 }
