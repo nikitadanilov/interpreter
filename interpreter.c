@@ -52,7 +52,10 @@ static struct opcode opcode[O_NR] = {};
 static void trace(uint64_t p);
 
 #define OI(x) OINIT(O_ ## x, L_ ## x, #x)
-#define CONT ({ ON_DEBUG(trace(pc)); goto *branches[*(uint8_t *)pc++]; })
+#define CONT ({					\
+	ON_DEBUG(trace(regs->r[R_PC])); 		\
+	goto *branches[*(uint8_t *)regs->r[R_PC]++];	\
+})
 
 enum { REGS = 16 };
 
@@ -62,16 +65,9 @@ struct regs {
 
 enum { R_PC = 0, R_SF = 1, R_SP = 2, R_REST = 3 };
 
-#define pc (regs.r[R_PC])
-#define sf (regs.r[R_SF])
-#define sp (regs.r[R_SP])
-
 struct proc {
 	struct regs regs;
 };
-
-#define REIFY ((struct proc) { .regs = regs })
-#define DEIFY(p) ({ regs = (p)->regs; })
 
 #define RF "%016"PRIx64
 
@@ -81,7 +77,7 @@ struct proc {
 #define U64(x) ((uint64_t)(x))
 #define P64(x) ((uint64_t *)(x))
 #define DEREF(x) (*P64(x))
-#define N8  (*(uint8_t *)pc++)
+#define N8  (*(uint8_t *)regs->r[R_PC]++)
 
 enum trapcode {
 	T_TRAP = 0x00, /* Trap instruction. */
@@ -126,14 +122,14 @@ enum {
 	uint8_t  idx  = next & AM_IDX;			\
 	switch (next & AM_MASK) {			\
 	case AM_IMM:					\
-		addr = U64(pc); 			\
-		pc += 8;				\
+		addr = U64(regs->r[R_PC]);      	\
+		regs->r[R_PC] += 8;			\
 		break;					\
 	case AM_SLOT:					\
-		addr = U64(P64(sf) + idx);		\
+		addr = U64(P64(regs->r[R_SF]) + idx);   \
 		break;					\
 	case AM_REG:					\
-		addr = U64(&regs.r[idx]);		\
+		addr = U64(&regs->r[idx]);		\
 		break;					\
 	default:					\
 		printf("Wrong mode: %02x\n", next);	\
@@ -169,18 +165,16 @@ enum {
 	((x) & 0x00ff000000000000) >> 48,	\
 	((x) & 0xff00000000000000) >> 56
 
-#define TRAP(code) ({ *p = REIFY; trap(p, (code)); DEIFY(p); })
-
 static void interpret(struct proc *p) {
 	static void *branches[O_NR] = {};
 	uint64_t     s0   = 0;
 	uint64_t     s1   = 0;
 	uint64_t     s2   = 0;
-	struct regs  regs = {};
+	struct regs *regs = &p->regs;
 
 	if (0) {
 	L_TRAP:
-		TRAP(T_TRAP);
+		trap(p, T_TRAP);
 		CONT;
 	L_HALT:
 		printf("Halt!\n");
@@ -193,15 +187,15 @@ static void interpret(struct proc *p) {
 		DEREF(s1) = s2;
 		ON_DEBUG(printf("    new("RF") == "RF"\n", DEREF(s0), s2));
 		if (unlikely(s2 == 0)) {
-			TRAP(T_OOM);
+			trap(p, T_OOM);
 		}
 		CONT;
 	L_RESUME:
 		s0 = ADDR;
 		s1 = ADDR;
-		DEREF(sf) = (uint64_t)pc;
-		sf = DEREF(s0);
-		pc = DEREF(s1);
+		DEREF(regs->r[R_SF]) = (uint64_t)regs->r[R_PC];
+		regs->r[R_SF] = DEREF(s0);
+		regs->r[R_PC] = DEREF(s1);
 		CONT;
 	L_SET:
 		s0 = ADDR;
@@ -230,10 +224,9 @@ static void interpret(struct proc *p) {
 		s1 = ADDR;
 		ON_DEBUG(printf("    "RF" == 0?\n", DEREF(s0)));
 		if (DEREF(s0) == 0)
-			pc = DEREF(s1);
+			regs->r[R_PC] = DEREF(s1);
 		CONT;
 	} else if (p != NULL) {
-		DEIFY(p);
 		CONT;
 	} else {
 		OI(TRAP);
@@ -597,17 +590,17 @@ static const char *atoc(const char *s, int *idx, char *out, int pos, int lval) {
 			OUT(out, odx, "0x%"PRIx64"ULL", val);
 		}
 	} else if (in(s, idx, ":")) { /* Slot. */
-		OUT(out, odx, "%s(P64(regs.r[R_SF]) + 0x%1x)",
+		OUT(out, odx, "%s(P64(regs->r[R_SF]) + 0x%1x)",
 		    lval ? "" : "DEREF", getnum(s, idx, 16));
 	} else if (in(s, idx, "r")) { /* Register */
-		OUT(out, odx, "%sregs.r[0x%1x]",
+		OUT(out, odx, "%sregs->r[0x%1x]",
 		    lval ? "&" : "", getnum(s, idx, 16));
 	} else if (in(s, idx, "pc")) {
-		OUT(out, odx, "%sregs.r[R_PC]", lval ? "&" : "");
+		OUT(out, odx, "%sregs->r[R_PC]", lval ? "&" : "");
 	} else if (in(s, idx, "sp")) {
-		OUT(out, odx, "%sregs.r[R_SP]", lval ? "&" : "");
+		OUT(out, odx, "%sregs->r[R_SP]", lval ? "&" : "");
 	} else if (in(s, idx, "sf")) {
-		OUT(out, odx, "%sregs.r[R_SF]", lval ? "&" : "");
+		OUT(out, odx, "%sregs->r[R_SF]", lval ? "&" : "");
 	} else if (in(s, idx, ".")) { /* Label */
 		int len = labellen(s, *idx);
 		if (lval) {
@@ -654,7 +647,7 @@ static char *ctoc1(const char *code, int lineno, char *out) {
 	if (in(code, &idx, "=")) {
 		OUT(out, odx, "%s", dtoc(code, &idx, scratch[0]));
 	} else if (in(code, &idx, "trap")) {
-		OUT(out, odx, "                TRAP(T_TRAP);");
+		OUT(out, odx, "                trap(regs, T_TRAP);");
 	} else if (in(code, &idx, "nop")) {
 		OUT(out, odx, "                ;");
 	} else if (in(code, &idx, "halt")) {
@@ -665,7 +658,7 @@ static char *ctoc1(const char *code, int lineno, char *out) {
 		OUT(out, odx,
     "                uint64_t size = %s;\n"
     "                if (unlikely((DEREF(%s) = alloc(size)) == 0)) {\n"
-    "                        TRAP(T_OOM);\n"
+    "                        trap(regs, T_OOM);\n"
     "                }",
 		    scratch[0], scratch[1]);
 	} else if (in(code, &idx, "resume")) {
@@ -674,8 +667,8 @@ static char *ctoc1(const char *code, int lineno, char *out) {
 		OUT(out, odx,
     "                uint64_t frame  = %s;\n"
     "                uint64_t target = %s;\n"
-    "                DEREF(regs.r[R_SF]) = U64(&&_L_%04i);\n"
-    "                regs.r[R_SF] = frame;\n"
+    "                DEREF(regs->r[R_SF]) = U64(&&_L_%04i);\n"
+    "                regs->r[R_SF] = frame;\n"
     "                goto *(void *)target;",
 		    scratch[0], scratch[1], lineno + 1);
 		post = 1;
